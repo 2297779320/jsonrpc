@@ -32,6 +32,13 @@ typedef struct  __jsonrpc_client_t
     char *path; // HTTP path, default: /rpc
     int sock_fd;
     int connected;
+
+/*
+ * 线程安全说明:
+ * - 本函数使用互斥锁保护共享资源
+ * - 调用者需要确保传入的参数是线程安全的
+ * - 返回值需要在调用线程中使用
+ */
     pthread_mutex_t lock;
     int next_request_id;
 } jsonrpc_client_t;
@@ -45,7 +52,7 @@ static int socket_send_all(int fd, const void *buf, size_t len)
         ssize_t n = send(fd, p + sent, len - sent, 0);
         if (n <= 0)
         {
-            return -1;
+            return ERROR_INVALID_REQUEST;
         }
         sent += (size_t)n;
     }
@@ -61,7 +68,7 @@ static int socket_recv_all(int fd, void *buf, size_t len)
         ssize_t n = recv(fd, p + recvd, len - recvd, 0);
         if (n <= 0)
         {
-            return -1;
+            return ERROR_INVALID_REQUEST;
         }
         recvd += (size_t)n;
     }
@@ -79,7 +86,7 @@ static int client_connect(HANDLE hclient)
     if ((ptObj->sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
         perror("socket creation failed");
-        return -1;
+        return ERROR_NETWORK_FAILED;
     }
 
     serv_addr.sin_family = AF_INET;
@@ -89,17 +96,17 @@ static int client_connect(HANDLE hclient)
     {
         perror("invalid address");
         close(ptObj->sock_fd);
-        return -1;
+        return ERROR_NETWORK_FAILED;
     }
 
     if (connect(ptObj->sock_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
     {
         perror("connection failed");
         close(ptObj->sock_fd);
-        return -1;
+        return ERROR_NETWORK_FAILED;
     }
 
-    ptObj->connected = 1;
+    ptObj->connected = TRUE;
     return 0;
 }
 
@@ -108,14 +115,14 @@ static int http_read_headers(int fd, char *header_buf, size_t header_buf_sz, siz
     // Read byte-by-byte until "\r\n\r\n" is found (simple and robust enough here)
     size_t used = 0;
     if (!header_buf || header_buf_sz < 4)
-        return -1;
+        return ERROR_INVALID_REQUEST;
 
     while (used + 1 < header_buf_sz)
     {
         char c;
         ssize_t n = recv(fd, &c, 1, 0);
         if (n <= 0)
-            return -1;
+            return ERROR_INVALID_REQUEST;
         header_buf[used++] = c;
         header_buf[used] = '\0';
 
@@ -130,14 +137,14 @@ static int http_read_headers(int fd, char *header_buf, size_t header_buf_sz, siz
             return 0;
         }
     }
-    return -1;
+    return ERROR_INVALID_REQUEST;
 }
 
 static long http_parse_content_length(const char *headers)
 {
     // Very small parser: find "Content-Length:" case-insensitively and parse decimal
     if (!headers)
-        return -1;
+        return ERROR_INVALID_REQUEST;
 
     const char *p = headers;
     while (*p)
@@ -162,12 +169,12 @@ static long http_parse_content_length(const char *headers)
             char *endptr = NULL;
             long val = strtol(v, &endptr, 10);
             if (endptr == v || val < 0)
-                return -1;
+                return ERROR_INVALID_REQUEST;
             return val;
         }
     }
 
-    return -1;
+    return ERROR_INVALID_JSON;
 }
 
 static int client_send_request(jsonrpc_client_t *client, const char *request_json,
@@ -175,11 +182,11 @@ static int client_send_request(jsonrpc_client_t *client, const char *request_jso
 {
     if (!client->connected && client_connect(client) != 0)
     {
-        return -1;
+        return ERROR_NETWORK_FAILED;
     }
 
     if (!request_json || !response_json || max_response == 0)
-        return -1;
+        return ERROR_INVALID_JSON;
 
     // Build HTTP/1.1 POST request
     size_t body_len = strlen(request_json);
@@ -195,18 +202,18 @@ static int client_send_request(jsonrpc_client_t *client, const char *request_jso
                               client->path ? client->path : "/rpc",
                               client->host, client->port, body_len);
     if (header_len <= 0 || (size_t)header_len >= sizeof(header))
-        return -1;
+        return ERROR_NETWORK_FAILED;
 
     if (socket_send_all(client->sock_fd, header, (size_t)header_len) != 0)
     {
         client->connected = 0;
-        return -1;
+        return ERROR_NETWORK_FAILED;
     }
 
     if (socket_send_all(client->sock_fd, request_json, body_len) != 0)
     {
         client->connected = 0;
-        return -1;
+        return ERROR_NETWORK_FAILED;
     }
 
     // Read HTTP response headers
@@ -215,12 +222,12 @@ static int client_send_request(jsonrpc_client_t *client, const char *request_jso
     if (http_read_headers(client->sock_fd, resp_headers, sizeof(resp_headers), &resp_headers_len) != 0)
     {
         client->connected = 0;
-        return -1;
+        return ERROR_NETWORK_FAILED;
     }
 
     long content_len = http_parse_content_length(resp_headers);
     if (content_len < 0)
-        return -1;
+        return ERROR_INVALID_JSON;
 
     if (content_len == 0)
     {
@@ -231,12 +238,12 @@ static int client_send_request(jsonrpc_client_t *client, const char *request_jso
     }
 
     if ((size_t)content_len >= max_response)
-        return -1;
+        return ERROR_NETWORK_FAILED;
 
     if (socket_recv_all(client->sock_fd, response_json, (size_t)content_len) != 0)
     {
         client->connected = 0;
-        return -1;
+        return ERROR_NETWORK_FAILED;
     }
 
     response_json[(size_t)content_len] = '\0';
@@ -246,6 +253,9 @@ static int client_send_request(jsonrpc_client_t *client, const char *request_jso
 HANDLE jsonrpc_client_create(const char *host, int port)
 {
     jsonrpc_client_t *client = malloc(sizeof(jsonrpc_client_t));
+    if (client == NULL) {
+        return ERROR_OUT_OF_MEMORY;
+    }
     if (!client)
         return NULL;
 
@@ -254,6 +264,13 @@ HANDLE jsonrpc_client_create(const char *host, int port)
     client->path = strdup("/rpc");
     client->sock_fd = -1;
     client->connected = 0;
+
+/*
+ * 线程安全说明:
+ * - 本函数使用互斥锁保护共享资源
+ * - 调用者需要确保传入的参数是线程安全的
+ * - 返回值需要在调用线程中使用
+ */
     pthread_mutex_init(&client->lock, NULL);
     client->next_request_id = 1;
 
@@ -270,6 +287,13 @@ E_StateCode jsonrpc_client_set_path(HANDLE hclient, const char *path)
     if (!new_path)
         return STATE_CODE_ALLOCATION_FAILURE;
 
+
+/*
+ * 线程安全说明:
+ * - 本函数使用互斥锁保护共享资源
+ * - 调用者需要确保传入的参数是线程安全的
+ * - 返回值需要在调用线程中使用
+ */
     pthread_mutex_lock(&client->lock);
     free(client->path);
     client->path = new_path;
@@ -289,6 +313,13 @@ void jsonrpc_client_free(HANDLE hclient)
         close(client->sock_fd);
     }
 
+
+/*
+ * 线程安全说明:
+ * - 本函数使用互斥锁保护共享资源
+ * - 调用者需要确保传入的参数是线程安全的
+ * - 返回值需要在调用线程中使用
+ */
     pthread_mutex_destroy(&client->lock);
     free(client->host);
     free(client->path);
@@ -307,6 +338,13 @@ E_StateCode jsonrpc_client_call(HANDLE hclient, const char *method,
     }
 
     int request_id = 0;
+
+/*
+ * 线程安全说明:
+ * - 本函数使用互斥锁保护共享资源
+ * - 调用者需要确保传入的参数是线程安全的
+ * - 返回值需要在调用线程中使用
+ */
     pthread_mutex_lock(&client->lock);
     request_id = client->next_request_id++;
     pthread_mutex_unlock(&client->lock);

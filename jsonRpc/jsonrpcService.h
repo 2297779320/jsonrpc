@@ -3,12 +3,8 @@
 
 #include "jsonrpc.h"
 #include "defs.h"
+#include "common_queue.h"
 EXTERN_C_BLOCK
-
-
-// 方法处理函数类型
-typedef cJSON* (*jsonrpc_method_handler)(cJSON *params, cJSON *id, void *user_data);
-
 
 /**********************************************************************
  * 函数名称：jsonrpc_service_create
@@ -21,7 +17,7 @@ typedef cJSON* (*jsonrpc_method_handler)(cJSON *params, cJSON *id, void *user_da
  * -----------------------------------------------
  * 2025/11/10        V1.0              chengjiahao
  ***********************************************************************/
-HANDLE jsonrpc_service_create(int port, void* ptUserData);
+HANDLE jsonrpc_service_create(int port);
 
 /**********************************************************************
  * 函数名称：jsonrpc_service_free
@@ -35,33 +31,6 @@ HANDLE jsonrpc_service_create(int port, void* ptUserData);
  * 2025/11/10        V1.0              chengjiahao
  ***********************************************************************/
 void jsonrpc_service_free(HANDLE hService);
-
-/**********************************************************************
- * 函数名称：jsonrpc_service_register_method
- * 功能描述：注册JSON-RPC方法
- * 输入参数：无
- * 输出参数：无
- * 返 回 值：    状态码
- * 其它说明：
- * 修改日期        版本号     修改人        修改内容
- * -----------------------------------------------
- * 2025/11/10        V1.0              chengjiahao
- ***********************************************************************/
-E_StateCode jsonrpc_service_register_method(HANDLE hservice, const char *name, 
-                                   jsonrpc_method_handler handler, void *user_data);
-
-/**********************************************************************
- * 函数名称：jsonrpc_service_unregister_method
- * 功能描述：注销JSON-RPC方法
- * 输入参数：无
- * 输出参数：无
- * 返 回 值：    状态码
- * 其它说明：
- * 修改日期        版本号     修改人        修改内容
- * -----------------------------------------------
- * 2025/11/10        V1.0              chengjiahao
- ***********************************************************************/                                   
-E_StateCode jsonrpc_service_unregister_method(HANDLE hservice, const char *name);
 
 /**********************************************************************
  * 函数名称：jsonrpc_service_start
@@ -90,11 +59,43 @@ int jsonrpc_service_start(HANDLE hservice);
 void jsonrpc_service_stop(HANDLE hservice);
 
 /**********************************************************************
- * 说明
- * 本库在 HTTP JSON-RPC 模式下仅保留“同步请求-响应”机制：
- * - 业务处理函数 `jsonrpc_method_handler` 直接返回 `cJSON*` 作为 result
- * - 不再提供异步消息分配/释放/回包接口
+ * 函数名称：JsonRpcServerAllocMsg
+ * 功能描述：获取JSON-RPC消息
+ * 输入参数：无
+ * 输出参数：无
+ * 返 回 值：    状态码
+ * 其它说明：
+ * 修改日期        版本号     修改人        修改内容
+ * -----------------------------------------------
+ * 2025/11/10        V1.0              chengjiahao
  ***********************************************************************/
+T_JsonRpcMsg* JsonRpcServerAllocMsg(HANDLE hService, UINT32 timeout);
+
+/**********************************************************************
+ * 函数名称：JsonRpcServerFreeMsg
+ * 功能描述： 释放JSON-RPC消息
+ * 输入参数：无
+ * 输出参数：无
+ * 返 回 值：    状态码
+ * 其它说明：
+ * 修改日期        版本号     修改人        修改内容
+ * -----------------------------------------------
+ * 2025/11/10        V1.0              chengjiahao
+ ***********************************************************************/
+E_StateCode JsonRpcServerFreeMsg(HANDLE hService, T_JsonRpcMsg* ptMsg);
+
+/**********************************************************************
+ * 函数名称：JsonRpcServerReply
+ * 功能描述：回复JSON-RPC消息
+ * 输入参数：无
+ * 输出参数：无
+ * 返 回 值：    状态码
+ * 其它说明：
+ * 修改日期        版本号     修改人        修改内容
+ * -----------------------------------------------
+ * 2025/11/10        V1.0              chengjiahao
+ ***********************************************************************/
+void JsonRpcServerReply(HANDLE hService, UINT32 uiCallId, E_StateCode eCode, void *data);
 
 EXTERN_C_BLOCK_END
 

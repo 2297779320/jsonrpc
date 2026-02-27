@@ -10,7 +10,7 @@
 #include <ctype.h>
 #include <strings.h>
 #include "cJSON.h"
-#include "common/common.h"
+#include "common.h"
 
  /***********************************************************
  *                      常量定义                                    *
@@ -33,15 +33,6 @@
  /***********************************************************
  *          文件内部使用的数据类型     *
  **********************************************************/
-
-typedef struct jsonrpc_method
-{
-    DECLARE_LIST_NODE_AT_HEAD();
-    char *method_name;
-    jsonrpc_method_handler handler;
-    void *user_data;
-} jsonrpc_method_t;
-
 typedef struct __jsonrpc_service_t
 {
     int port;
@@ -50,10 +41,11 @@ typedef struct __jsonrpc_service_t
     TSK_Handle hDetectTsk;
     BOOL bTskDone;
 
-    T_StdListDef  tMethodList;
+    // T_StdListDef  tMethodList;
+    CommQueID  Msgque;
 	T_MutexObj tMutex; // 操作锁
 
-    void *user_data;
+    // void *user_data;
 
 } jsonrpc_service_t;
 
@@ -74,7 +66,7 @@ static int socket_send_all(int fd, const void *data, size_t len)
         ssize_t n = send(fd, p + sent, len - sent, 0);
         if (n <= 0)
         {
-            return -1;
+            return ERROR_INVALID_REQUEST;
         }
         sent += (size_t)n;
     }
@@ -89,7 +81,7 @@ static int socket_send(int fd, const char *data, size_t len)
         ssize_t n = send(fd, data + sent, len - sent, 0);
         if (n <= 0)
         {
-            return -1;
+            return ERROR_INVALID_REQUEST;
         }
         sent += n;
     }
@@ -104,7 +96,7 @@ static int socket_recv_all(int fd, void *buffer, size_t len)
     {
         ssize_t n = recv(fd, p + received, len - received, 0);
         if (n <= 0)
-            return -1;
+            return ERROR_INVALID_REQUEST;
         received += (size_t)n;
     }
     return 0;
@@ -114,14 +106,14 @@ static int http_read_headers(int fd, char *header_buf, size_t header_buf_sz, siz
 {
     size_t used = 0;
     if (!header_buf || header_buf_sz < 4)
-        return -1;
+        return ERROR_INVALID_REQUEST;
 
     while (used + 1 < header_buf_sz)
     {
         char c;
         ssize_t n = recv(fd, &c, 1, 0);
         if (n <= 0)
-            return -1;
+            return ERROR_INVALID_REQUEST;
         header_buf[used++] = c;
         header_buf[used] = '\0';
 
@@ -136,13 +128,13 @@ static int http_read_headers(int fd, char *header_buf, size_t header_buf_sz, siz
             return 0;
         }
     }
-    return -1;
+    return ERROR_INVALID_REQUEST;
 }
 
 static long http_parse_content_length(const char *headers)
 {
     if (!headers)
-        return -1;
+        return ERROR_INVALID_REQUEST;
 
     const char *p = headers;
     while (*p)
@@ -163,22 +155,22 @@ static long http_parse_content_length(const char *headers)
             char *endptr = NULL;
             long val = strtol(v, &endptr, 10);
             if (endptr == v || val < 0)
-                return -1;
+                return ERROR_INVALID_REQUEST;
             return val;
         }
     }
 
-    return -1;
+    return ERROR_INVALID_JSON;
 }
 
 static int http_send_response(int fd, int status, const char *json_body)
 {
     const char *reason = "OK";
-    if (status == 204) reason = "No Content";
-    else if (status == 400) reason = "Bad Request";
-    else if (status == 500) reason = "Internal Server Error";
+    if (status == HTTP_STATUS_NO_CONTENT) reason = "No Content";
+    else if (status == HTTP_STATUS_BAD_REQUEST) reason = "Bad Request";
+    else if (status == HTTP_STATUS_INTERNAL_ERROR) reason = "Internal Server Error";
 
-    if (!json_body || status == 204)
+    if (!json_body || status == HTTP_STATUS_NO_CONTENT)
     {
         char hdr[256];
         int n = snprintf(hdr, sizeof(hdr),
@@ -188,7 +180,7 @@ static int http_send_response(int fd, int status, const char *json_body)
                          "\r\n",
                          status, reason);
         if (n <= 0 || (size_t)n >= sizeof(hdr))
-            return -1;
+            return ERROR_NETWORK_FAILED;
         return socket_send_all(fd, hdr, (size_t)n);
     }
 
@@ -202,9 +194,9 @@ static int http_send_response(int fd, int status, const char *json_body)
                      "\r\n",
                      status, reason, body_len);
     if (n <= 0 || (size_t)n >= sizeof(hdr))
-        return -1;
+        return ERROR_NETWORK_FAILED;
     if (socket_send_all(fd, hdr, (size_t)n) != 0)
-        return -1;
+        return ERROR_NETWORK_FAILED;
     return socket_send_all(fd, json_body, body_len);
 }
 
@@ -213,19 +205,19 @@ static int http_recv_request(int fd, char *body_buf, size_t body_buf_sz)
     size_t received = 0;
 
     if (!body_buf || body_buf_sz == 0)
-        return -1;
+        return ERROR_INVALID_REQUEST;
 
     // headers
     char headers[4096];
     size_t headers_len = 0;
     if (http_read_headers(fd, headers, sizeof(headers), &headers_len) != 0)
-        return -1;
+        return ERROR_INVALID_REQUEST;
 
     long content_len = http_parse_content_length(headers);
     if (content_len < 0)
-        return -1;
+        return ERROR_INVALID_REQUEST;
     if ((size_t)content_len >= body_buf_sz)
-        return -1;
+        return ERROR_INVALID_REQUEST;
 
     if (content_len == 0)
     {
@@ -234,44 +226,41 @@ static int http_recv_request(int fd, char *body_buf, size_t body_buf_sz)
     }
 
     if (socket_recv_all(fd, body_buf, (size_t)content_len) != 0)
-        return -1;
+        return ERROR_NETWORK_FAILED;
     received = (size_t)content_len;
     body_buf[received] = '\0';
     return (int)received;
 }
 
-static jsonrpc_method_t *MethodFindNode(jsonrpc_service_t *ptObj, const char *name)
-{
-	jsonrpc_method_t *ptNode = NULL;
-	jsonrpc_method_t *ptNextNode = NULL;
+// static jsonrpc_method_t *MethodFindNode(jsonrpc_service_t *ptObj, const char *name)
+// {
+// 	jsonrpc_method_t *ptNode = NULL;
+// 	jsonrpc_method_t *ptNextNode = NULL;
 
 
-	ptNode = (jsonrpc_method_t *)StdListGetHeadNode(&ptObj->tMethodList);
+// 	ptNode = (jsonrpc_method_t *)StdListGetHeadNode(&ptObj->tMethodList);
 
-	while (NULL != ptNode)
-	{
-		ptNextNode = (jsonrpc_method_t *)StdListGetNextNode((PT_StdNodeDef)ptNode);
-		if (strcmp(ptNode->method_name, name) == 0)
-        {
-            return ptNode;
-        }
-		ptNode = ptNextNode;
-	}
-	return NULL;
-}
+// 	while (NULL != ptNode)
+// 	{
+// 		ptNextNode = (jsonrpc_method_t *)StdListGetNextNode((PT_StdNodeDef)ptNode);
+// 		if (strcmp(ptNode->method_name, name) == 0)
+//         {
+//             return ptNode;
+//         }
+// 		ptNode = ptNextNode;
+// 	}
+// 	return NULL;
+// }
 
 static int handle_jsonrpc_request(jsonrpc_service_t *service, const char *request,
                                   int client_fd)
 {
     cJSON *request_json = cJSON_Parse(request);
-    cJSON *response_json = NULL;
-    char *response_str = NULL;
-    int ret = -1;
-    int is_notification = 0;
+    T_JsonRpcMsg *pTMsg = NULL;
+    int ret = 0;
 
     if (!request_json)
     {
-        response_json = jsonrpc_create_error(JSONRPC_PARSE_ERROR, "Parse error", NULL, NULL);
         goto done;
     }
 
@@ -280,8 +269,6 @@ static int handle_jsonrpc_request(jsonrpc_service_t *service, const char *reques
     if (!version || !cJSON_IsString(version) ||
         strcmp(version->valuestring, JSONRPC_VERSION) != 0)
     {
-        response_json = jsonrpc_create_error(JSONRPC_INVALID_REQUEST,
-                                             "Invalid JSON-RPC version", NULL, NULL);
         goto done;
     }
 
@@ -289,99 +276,30 @@ static int handle_jsonrpc_request(jsonrpc_service_t *service, const char *reques
     cJSON *method = cJSON_GetObjectItem(request_json, "method");
     if (!method || !cJSON_IsString(method))
     {
-        response_json = jsonrpc_create_error(JSONRPC_INVALID_REQUEST,
-                                             "Method not specified", NULL, NULL);
         goto done;
     }
 
     // 获取ID
     cJSON *id = cJSON_GetObjectItem(request_json, "id");
-    if (!id || cJSON_IsNull(id))
-    {
-        // notification: must not reply
-        is_notification = 1;
-    }
-    cJSON *id_dup = NULL;
-    if (!is_notification && id)
-    {
-        id_dup = cJSON_Duplicate(id, 1);
-        if (!id_dup)
-        {
-            response_json = jsonrpc_create_error(JSONRPC_INTERNAL_ERROR,
-                                                 "Allocation failure", NULL, NULL);
-            goto done;
-        }
-    }
-
-    // 查找方法
-    OSAL_MutexLock(&service->tMutex);
-    jsonrpc_method_t *method_handler = MethodFindNode(service, method->valuestring);
-    OSAL_MutexUnlock(&service->tMutex);
-    if (!method_handler)
-    {
-        if (is_notification)
-        {
-            ret = 0;
-            goto done;
-        }
-        response_json = jsonrpc_create_error(JSONRPC_METHOD_NOT_FOUND,
-                                             "Method not found", NULL, id_dup);
-        goto done;
-    }
 
     // 获取参数
     cJSON *params = cJSON_GetObjectItem(request_json, "params");
-    cJSON *params_dup = params ? cJSON_Duplicate(params, 1) : NULL;
-    // handler 入参使用副本：避免 handler 保存指针导致 request_json 释放后悬空
-    // id 也传副本，避免 handler 误用/释放原始请求里的 id
-    cJSON *id_for_handler = id_dup ? cJSON_Duplicate(id_dup, 1) : NULL;
 
-    // 调用方法
-    cJSON *result = method_handler->handler(params_dup, id_for_handler, method_handler->user_data);
-    if (params_dup)
-        cJSON_Delete(params_dup);
-    if (id_for_handler)
-        cJSON_Delete(id_for_handler);
-    if (result)
+    pTMsg = CommQue_GetEmpty(service->Msgque);
+    if (NULL == pTMsg)
+    return ERROR_INVALID_PARAMETER;
     {
-        if (!is_notification)
-            response_json = jsonrpc_create_response(result, id_dup);
-        else
-            cJSON_Delete(result); // don't leak handler result for notifications
-    }
-    else
-    {
-        if (!is_notification)
-        {
-            response_json = jsonrpc_create_error(JSONRPC_INTERNAL_ERROR,
-                                                 "error", NULL, id_dup);
-        }
+        goto done;
     }
 
+    // pTMsg->client_fd = client_fd;
+    strncpy(pTMsg->strMethod, method->valuestring, sizeof(pTMsg->strMethod) - 1);
+    pTMsg->strMethod[sizeof(pTMsg->strMethod) - 1] = '\0';;
+    pTMsg->pcData = cJSON_Print(params);
+    pTMsg->uiCallId = id->valueint;
+
+    CommQue_PutFull(service->Msgque, pTMsg);
 done:
-    if (is_notification)
-    {
-        // Per JSON-RPC 2.0, no response for notifications.
-        if (request_json)
-            cJSON_Delete(request_json);
-        if (response_json)
-            cJSON_Delete(response_json);
-        return 0;
-    }
-
-    if (response_json)
-    {
-        response_str = cJSON_PrintUnformatted(response_json);
-        if (response_str)
-        {
-            // HTTP response
-            if (http_send_response(client_fd, 200, response_str) == 0)
-                ret = 0;
-            free(response_str);
-        }
-        cJSON_Delete(response_json);
-    }
-
     if (request_json)
         cJSON_Delete(request_json);
     return ret;
@@ -471,20 +389,59 @@ static void *service_main_loop(void *arg)
 
         // 为每个客户端创建新线程
         client_context_t *ctx = malloc(sizeof(client_context_t));
-        ctx->client_fd = client_fd;
-        ctx->service = service;
-        pthread_t client_thread;
-        pthread_create(&client_thread, NULL, handle_client_connection, ctx);
-        pthread_detach(client_thread);
-    }
+        if (ctx == NULL) {
+            return ERROR_OUT_OF_MEMORY;
+        }
+            ctx->client_fd = client_fd;
+            ctx->service = service;
+            pthread_t client_thread;
+            pthread_create(&client_thread, NULL, handle_client_connection, ctx);
+            pthread_detach(client_thread);
+        }
 
     close(service->server_fd);
     return NULL;
 }
 
-HANDLE jsonrpc_service_create(int port, void* ptUserData)
+E_StateCode JsonRpcServerReply(HANDLE hService, UINT32 uiCallId, E_StateCode eCode, void *data)
+{
+    E_StateCode eCode = STATE_CODE_NO_ERROR;
+    jsonrpc_service_t *service = NULL;
+    cJSON *response_json = NULL;
+    char *response_str = NULL;
+    JSONRPC_SERVICE_CHECK_AND_SET(hService, STATE_CODE_INVALID_HANDLE);
+
+    service = (jsonrpc_service_t *)hService;
+
+    cJSON *result = cJSON_Parse(data);
+    response_json = jsonrpc_create_response(result, cJSON_CreateNumber(uiCallId));
+    cJSON_AddNumberToObject(response_json, "eCode", eCode);
+
+    if (response_json)
+    {
+        response_str = cJSON_PrintUnformatted(response_json);
+        if (response_str)
+        {
+            // 发送响应
+            uint32_t len = htonl(strlen(response_str));
+            if (socket_send(service->client_fd, (char *)&len, sizeof(len)) == 0)
+            {
+                socket_send(service->client_fd, response_str, strlen(response_str));
+            }
+            free(response_str);
+        }
+        cJSON_Delete(response_json);
+    }
+    cJSON_Delete(result);
+    return eCode;
+}
+
+HANDLE jsonrpc_service_create(int port)
 {
     jsonrpc_service_t *service = malloc(sizeof(jsonrpc_service_t));
+    if (service == NULL) {
+        return ERROR_OUT_OF_MEMORY;
+    }
     if (!service)
         return NULL;
 
@@ -493,84 +450,53 @@ HANDLE jsonrpc_service_create(int port, void* ptUserData)
     service->bTskDone = FALSE;
     OSAL_MutexInit(&service->tMutex);
     StdListInit(&service->tMethodList);
-    service->user_data = ptUserData;
+    service->Msgque = CommQue_Create(50, sizeof(T_JsonRpcMsg), NULL);
 
     return service;
 }
 
-void jsonrpc_service_free(HANDLE hService)
-{
-    jsonrpc_service_t *ptObj = (jsonrpc_service_t *)hService;
-    if (!ptObj)
-        return;
 
-    jsonrpc_service_stop(ptObj);
-
-    OSAL_MutexDestroy(&ptObj->tMutex);
-    free(ptObj);
-}
-
-int jsonrpc_service_register_method(HANDLE hservice, const char *name,
-                                    jsonrpc_method_handler handler, void *user_data)
+static E_StateCode clear_queue(CommQueID  Msgque)
 {
     E_StateCode eCode = STATE_CODE_NO_ERROR;
-    jsonrpc_method_t *ptNode = NULL;
-    jsonrpc_service_t *service = NULL;
-    JSONRPC_SERVICE_CHECK_AND_SET(hservice, STATE_CODE_INVALID_HANDLE);
-
-    service = (jsonrpc_service_t *)hservice;
-
-    if (!service || !name || !handler)
-        return STATE_CODE_INVALID_PARAM;
-
-    ptNode = MethodFindNode(service, name);
-    if(ptNode != NULL)
+    T_JsonRpcMsg *pTMsg = NULL;
+    if(!Msgque)
     {
-        syslog("Service: Method '%s' already registered\n", name);
-        return eCode;
+        return STATE_CODE_INVALID_PARAM;
     }
+   
+    while (1)
+    {
+        pTMsg = CommQue_GetFull(Msgque, OSAL_TIMEOUT_NONE);
+        if(!pTMsg)
+        {
+            break;
+        }
+        
+        if(pTMsg->pcData)
+        {
+            free(pTMsg->pcData);
+            pTMsg->pcData = NULL;
+        }
+        CommQue_PutEmpty(Msgque, pTMsg);
+    }
+    CommQue_Clear(Msgque);
 
-    LJ_SAFE_MALLOC(ptNode, sizeof(jsonrpc_method_t));
-    if (!ptNode)
-        return STATE_CODE_ALLOCATION_FAILURE;
-
-    ptNode->method_name = strdup(name);
-    ptNode->handler = handler;
-    ptNode->user_data = user_data;
-
-    OSAL_MutexLock(&service->tMutex);
-    StdListPushBack(&service->tMethodList, (PT_StdNodeDef)ptNode);
-    OSAL_MutexUnlock(&service->tMutex);
-    syslog("Service: Registered method '%s'\n", name);
     return eCode;
 }
 
-E_StateCode jsonrpc_service_unregister_method(HANDLE hservice, const char *name)
+E_StateCode jsonrpc_service_free(HANDLE hService)
 {
     E_StateCode eCode = STATE_CODE_NO_ERROR;
-    jsonrpc_method_t *ptNode = NULL;
-    jsonrpc_service_t *service = NULL;
-    JSONRPC_SERVICE_CHECK_AND_SET(hservice, STATE_CODE_INVALID_HANDLE);
-
-    service = (jsonrpc_service_t *)hservice;
-
-    if (!service || !name)
-        return STATE_CODE_INVALID_PARAM;
-
-    ptNode = MethodFindNode(service, name);
-
-    if(ptNode == NULL)
-    {
-        syslog("Service: Method '%s' not found\n", name);
+    jsonrpc_service_t *ptObj = (jsonrpc_service_t *)hService;
+    if (!ptObj)
         return eCode;
-    }
 
-    OSAL_MutexLock(&service->tMutex);
-    StdListRemove(&service->tMethodList, (PT_StdNodeDef)ptNode);
-    free(ptNode->method_name);
-    free(ptNode);
-    OSAL_MutexUnlock(&service->tMutex);
-    syslog("Service: unRegistered method '%s'\n", name);
+    eCode = jsonrpc_service_stop(ptObj);
+    clear_queue(ptObj->Msgque);
+    CommQue_Delete(ptObj->Msgque);
+    OSAL_MutexDestroy(&ptObj->tMutex);
+    free(ptObj);
     return eCode;
 }
 
@@ -582,13 +508,7 @@ E_StateCode jsonrpc_service_start(HANDLE hservice)
 
     service = (jsonrpc_service_t *)hservice;
 
-    OSAL_MutexLock(&service->tMutex);
-
-    // if (service->bTskDone)//!待完善
-    // {
-    //     goto end;
-    // }
-        
+    OSAL_MutexLock(&service->tMutex);        
     TSK_Attrs attrs = DEFAULT_TSK_ATTR;
     service->bTskDone = FALSE;
 
@@ -603,16 +523,16 @@ E_StateCode jsonrpc_service_start(HANDLE hservice)
         syserr("TSK_create failed\n");
         eCode =  STATE_CODE_ALLOCATION_FAILURE;
     }
-// end:
+
     OSAL_MutexUnlock(&service->tMutex);
     return eCode;
 }
 
-void jsonrpc_service_stop(HANDLE hservice)
+E_StateCode jsonrpc_service_stop(HANDLE hservice)
 {
+    E_StateCode eCode = STATE_CODE_NO_ERROR;
     jsonrpc_service_t *service = (jsonrpc_service_t *)hservice;
-
-    JSONRPC_SERVICE_CHECK_AND_SET(hservice, );
+    JSONRPC_SERVICE_CHECK_AND_SET(hservice, STATE_CODE_INVALID_HANDLE);
 
     OSAL_MutexLock(&service->tMutex);
     service->bTskDone = TRUE;
@@ -627,4 +547,64 @@ void jsonrpc_service_stop(HANDLE hservice)
 
     OSAL_MutexUnlock(&service->tMutex);
     syslog("Service stopped\n");
+    return eCode;
+}
+
+/**********************************************************************
+ * 函数名称：JsonRpcServerAllocMsg
+ * 功能描述：获取JSON-RPC消息
+ * 输入参数：无
+ * 输出参数：无
+ * 返 回 值：    状态码
+ * 其它说明：
+ * 修改日期        版本号     修改人        修改内容
+ * -----------------------------------------------
+ * 2025/11/10        V1.0              chengjiahao
+ ***********************************************************************/
+T_JsonRpcMsg* JsonRpcServerAllocMsg(HANDLE hService, UINT32 timeout)
+{
+    jsonrpc_service_t *service = (jsonrpc_service_t *)hService;
+    T_JsonRpcMsg *pTMsg = NULL;
+
+    JSONRPC_SERVICE_CHECK_AND_SET(hService, NULL);
+
+    pTMsg = CommQue_GetFull(service->Msgque, timeout);
+    if (NULL == pTMsg)
+    return ERROR_INVALID_PARAMETER;
+    {
+        goto done;
+    }
+done:
+    return pTMsg;
+}
+
+/**********************************************************************
+ * 函数名称：JsonRpcServerFreeMsg
+ * 功能描述： 释放JSON-RPC消息
+ * 输入参数：无
+ * 输出参数：无
+ * 返 回 值：    状态码
+ * 其它说明：
+ * 修改日期        版本号     修改人        修改内容
+ * -----------------------------------------------
+ * 2025/11/10        V1.0              chengjiahao
+ ***********************************************************************/
+E_StateCode JsonRpcServerFreeMsg(HANDLE hService, T_JsonRpcMsg* ptMsg)
+{
+    jsonrpc_service_t *service = (jsonrpc_service_t *)hService;
+    E_StateCode eCode = STATE_CODE_NO_ERROR;
+
+    JSONRPC_SERVICE_CHECK_AND_SET(hService, STATE_CODE_INVALID_HANDLE);
+
+    if (NULL != ptMsg)
+    {
+        if (NULL != ptMsg->pcData)
+        {
+            free(ptMsg->pcData);
+            ptMsg->pcData = NULL;
+        }
+    }
+    memset(ptMsg, 0, sizeof(T_JsonRpcMsg));
+    CommQue_PutEmpty(service->Msgque, ptMsg);
+    return eCode;
 }

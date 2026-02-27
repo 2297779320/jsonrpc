@@ -5,7 +5,6 @@
 
 EXTERN_C_BLOCK
 
-
 /**********************************************************************
  * 函数名称：jsonrpc_client_create
  * 功能描述：创建JSON-RPC客户端
@@ -45,7 +44,10 @@ void jsonrpc_client_free(HANDLE hclient);
 /**********************************************************************
  * 函数名称：jsonrpc_client_call
  * 功能描述：远程调用JSON-RPC方法
- * 输入参数：无
+ * 输入参数：hclient: 客户端句柄
+ *          method: 方法名
+ *          params: 参数JSON对象(可NULL)
+ *          result: 指向结果JSON对象指针的指针(可NULL)
  * 输出参数：无
  * 返 回 值：    状态码
  * 其它说明：
@@ -56,9 +58,6 @@ void jsonrpc_client_free(HANDLE hclient);
 E_StateCode jsonrpc_client_call(HANDLE hclient, const char *method, 
                           cJSON *params, cJSON **result);
                           
-// int jsonrpc_client_call_async(HANDLE hclient, const char *method, 
-//                              cJSON *params, cJSON **result);
-
 EXTERN_C_BLOCK_END
 
 #endif // JSONRPC_CLIENT_H
